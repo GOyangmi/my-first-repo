@@ -10,33 +10,50 @@ const LM_URL = config.lm_url;
 const MODEL = config.model;
 const PROJECTS = config.projects;
 
-// ========================
-// GLOBAL STATE
-// ========================
+// =========================
+// STATE (CORE SAFETY)
+// =========================
 let queue = [];
 let processing = false;
-let globalLock = false;
+let systemLocked = false;
 
 const debounceMap = new Map();
+const runningDirs = new Set();
+
 const MAX_DIFF_SIZE = 8000;
 const DEBOUNCE_MS = 2000;
 const MAX_RETRY = 2;
 
-// ========================
-// HASH
-// ========================
+// =========================
+// LOG SYSTEM
+// =========================
+const LOG_FILE = path.join(__dirname, "agent.log");
+
+function log(type, msg, data = "") {
+  const line = `[${new Date().toISOString()}] [${type}] ${msg} ${data}\n`;
+  fs.appendFileSync(LOG_FILE, line);
+  console.log(line.trim());
+}
+
+// =========================
+// UTILS
+// =========================
 function hash(str) {
   return crypto.createHash("md5").update(str).digest("hex");
 }
 
-// ========================
-// SAFE GIT CHECK
-// ========================
+function sleep(ms) {
+  return new Promise(r => setTimeout(r, ms));
+}
+
+// =========================
+// GIT SAFETY CHECK
+// =========================
 function isGitRepo(dir) {
   return fs.existsSync(path.join(dir, ".git"));
 }
 
-function isGitBusy(dir) {
+function isGitLocked(dir) {
   try {
     execSync("git status --porcelain", { cwd: dir, stdio: "pipe" });
     return false;
@@ -45,32 +62,32 @@ function isGitBusy(dir) {
   }
 }
 
-// ========================
-// SAFE DIFF
-// ========================
+// =========================
+// DIFF SAFE
+// =========================
 function getDiff(dir) {
   try {
     execSync("git add .", { cwd: dir, stdio: "ignore" });
 
     let diff = execSync("git diff --cached", {
       cwd: dir,
-      encoding: "utf-8"
+      encoding: "utf8"
     });
 
-    if (diff.length > MAX_DIFF_SIZE) {
-      diff = diff.slice(0, MAX_DIFF_SIZE);
-    }
+    if (!diff) return "";
+    if (diff.length > MAX_DIFF_SIZE) diff = diff.slice(0, MAX_DIFF_SIZE);
 
     return diff;
-  } catch {
+  } catch (e) {
+    log("ERROR", "diff_failed", e.message);
     return "";
   }
 }
 
-// ========================
-// AI CALL (SAFE)
-// ========================
-async function analyzeDiff(diff) {
+// =========================
+// AI CALL (HARD SAFE)
+// =========================
+async function callAI(diff) {
   try {
     const res = await fetch(LM_URL, {
       method: "POST",
@@ -80,8 +97,23 @@ async function analyzeDiff(diff) {
         messages: [
           {
             role: "system",
-            content:
-              "Return ONLY JSON {type, message}. No markdown, no explanation."
+            content: `
+You are a git decision agent.
+
+Return ONLY valid JSON:
+
+{
+  "action": "commit | skip | retry | fix",
+  "message": "short message",
+  "reason": "explanation"
+}
+
+Rules:
+- skip: trivial or lock files
+- commit: meaningful change
+- retry: uncertain output
+- fix: repo instability detected
+`
           },
           {
             role: "user",
@@ -93,77 +125,158 @@ async function analyzeDiff(diff) {
     });
 
     const data = await res.json();
-    let text = data?.choices?.[0]?.message?.content || "";
+    const text = data?.choices?.[0]?.message?.content || "";
 
     if (!text || !text.trim().startsWith("{")) {
+      log("WARN", "AI_INVALID_RESPONSE", text);
       return null;
     }
 
     return JSON.parse(text);
-  } catch {
+  } catch (e) {
+    log("ERROR", "AI_FAILED", e.message);
     return null;
   }
 }
 
-// ========================
-// RETRY WRAPPER
-// ========================
-async function safeAnalyze(diff) {
-  for (let i = 0; i < MAX_RETRY; i++) {
-    const result = await analyzeDiff(diff);
-    if (result) return result;
+// =========================
+// SAFE DECISION WRAPPER
+// =========================
+function safeDecision(d) {
+  if (!d || typeof d !== "object") {
+    return { action: "skip", message: "fallback", reason: "null" };
   }
 
-  return { type: "chore", message: "auto update" };
+  if (!d.action) {
+    return { action: "skip", message: "no-action", reason: "invalid-schema" };
+  }
+
+  return d;
 }
 
-// ========================
-// PROCESS PROJECT
-// ========================
-async function processProject(dir) {
-  if (!isGitRepo(dir)) return;
-  if (isGitBusy(dir)) return;
-
-  const diff = getDiff(dir);
-  if (!diff) return;
-
-  const key = hash(diff);
-
-  const stateFile = path.join(dir, ".agent_state.json");
-  let state = {};
-
+// =========================
+// GIT RECOVERY
+// =========================
+function gitRecovery(dir) {
   try {
-    if (fs.existsSync(stateFile)) {
-      state = JSON.parse(fs.readFileSync(stateFile, "utf-8"));
+    log("RECOVERY", "git reset/clean");
+
+    execSync("git reset --hard", { cwd: dir, stdio: "ignore" });
+    execSync("git clean -fd", { cwd: dir, stdio: "ignore" });
+
+    log("RECOVERY_OK", dir);
+  } catch (e) {
+    log("RECOVERY_FAIL", e.message);
+  }
+}
+
+// =========================
+// EXECUTE ACTION
+// =========================
+async function execute(dir, decision) {
+  log("DECISION", JSON.stringify(decision));
+
+  if (decision.action === "skip") {
+    log("SKIP", dir);
+    return;
+  }
+
+  if (decision.action === "retry") {
+    log("RETRY", dir);
+    setTimeout(() => enqueue(dir), 3000);
+    return;
+  }
+
+  if (decision.action === "fix") {
+    log("FIX", dir);
+    gitRecovery(dir);
+    queue = [];
+    processing = false;
+    return;
+  }
+
+  if (decision.action === "commit") {
+    try {
+      execSync(`git commit -m "${decision.message}"`, {
+        cwd: dir,
+        stdio: "ignore"
+      });
+
+      execSync(`git push origin main`, {
+        cwd: dir,
+        stdio: "ignore"
+      });
+
+      log("SUCCESS", "commit+push");
+    } catch (e) {
+      log("ERROR", "git_failed");
+      gitRecovery(dir);
+
+      setTimeout(() => enqueue(dir), 5000);
     }
-  } catch {}
-
-  if (state.lastHash === key) return;
-
-  state.lastHash = key;
-
-  const result = await safeAnalyze(diff);
-
-  const message = `[${result.type}] ${result.message}`;
-
-  try {
-    execSync(`git commit -m "${message}"`, { cwd: dir, stdio: "ignore" });
-    execSync(`git push origin main`, { cwd: dir, stdio: "ignore" });
-
-    console.log(`✅ ${path.basename(dir)} OK`);
-  } catch (err) {
-    console.log(`❌ ${path.basename(dir)} FAILED → retry later`);
-
-    // 실패 복구 큐
-    setTimeout(() => enqueue(dir), 5000);
   }
-
-  fs.writeFileSync(stateFile, JSON.stringify(state, null, 2));
 }
 
-// ========================
-// QUEUE SYSTEM (STRICT)
-// ========================
+// =========================
+// PROCESS CORE
+// =========================
+async function processProject(dir) {
+  if (systemLocked) return;
+  if (!isGitRepo(dir)) return;
+  if (isGitLocked(dir)) return;
+
+  if (runningDirs.has(dir)) return;
+  runningDirs.add(dir);
+
+  try {
+    const diff = getDiff(dir);
+    if (!diff) return;
+
+    const key = hash(diff);
+
+    const stateFile = path.join(dir, ".agent_state.json");
+    let state = {};
+
+    try {
+      if (fs.existsSync(stateFile)) {
+        state = JSON.parse(fs.readFileSync(stateFile, "utf8"));
+      }
+    } catch {}
+
+    if (state.lastHash === key) {
+      log("SKIP_DUPLICATE", dir);
+      return;
+    }
+
+    state.lastHash = key;
+
+    const ai = await callAI(diff);
+    const decision = safeDecision(ai);
+
+    await execute(dir, decision);
+
+    fs.writeFileSync(stateFile, JSON.stringify(state, null, 2));
+  } catch (e) {
+    log("FATAL", e.message);
+    systemLocked = true;
+
+    setTimeout(() => {
+      systemLocked = false;
+      log("UNLOCK", "system recovered");
+    }, 5000);
+  } finally {
+    runningDirs.delete(dir);
+  }
+}
+
+// =========================
+// QUEUE SYSTEM
+// =========================
+function enqueue(dir) {
+  if (!queue.includes(dir)) queue.push(dir);
+  worker();
+}
+
 async function worker() {
   if (processing) return;
   processing = true;
@@ -176,25 +289,15 @@ async function worker() {
   processing = false;
 }
 
-function enqueue(dir) {
-  if (!queue.includes(dir)) {
-    queue.push(dir);
-  }
-  worker();
-}
-
-// ========================
-// DEBOUNCE (EVENT STORM FIX)
-// ========================
+// =========================
+// DEBOUNCE (EVENT CONTROL)
+// =========================
 function trigger(filePath) {
   clearTimeout(debounceMap.get(filePath));
 
   const t = setTimeout(() => {
     for (const dir of PROJECTS) {
-      const fp = filePath.replaceAll("\\", "/");
-      const d = dir.replaceAll("\\", "/");
-
-      if (fp.startsWith(d)) {
+      if (filePath.replaceAll("\\", "/").startsWith(dir.replaceAll("\\", "/"))) {
         enqueue(dir);
       }
     }
@@ -203,13 +306,13 @@ function trigger(filePath) {
   debounceMap.set(filePath, t);
 }
 
-// ========================
+// =========================
 // START
-// ========================
-console.log("🚀 AI CENTRAL AGENT v7.3 (STABLE OPS MODE)");
+// =========================
+console.log("🚀 v8.3 STABLE SELF-HEALING AGENT STARTED");
 
 for (const dir of PROJECTS) {
-  console.log("📁 watching:", dir);
+  log("WATCH", dir);
 
   chokidar.watch(dir, {
     ignored: ["node_modules", ".git", "dist", "build"],
