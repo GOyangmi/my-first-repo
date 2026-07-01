@@ -1,99 +1,129 @@
 const chokidar = require("chokidar");
-const { exec } = require("child_process");
-const path = require("path");
+const { execSync } = require("child_process");
 
-const repoPath = process.cwd();
+const WATCH_PATH = ".";
+const LM_URL = "http://127.0.0.1:1234/v1/chat/completions";
+const MODEL = "qwen/qwen3.5-9b";
 
-// 🔥 상태 관리
 let isProcessing = false;
 let lastHash = "";
 
-// ⏱ debounce 타이머
-let timer = null;
-
-// 🚫 무시할 경로
-const ignorePatterns = [
-  "node_modules",
-  ".git",
-  "package-lock.json"
-];
-
-// -------------------------
-// Git 실행 함수
-// -------------------------
-function run(cmd) {
-  return new Promise((resolve, reject) => {
-    exec(cmd, (err, stdout, stderr) => {
-      if (err) reject(stderr || err);
-      else resolve(stdout);
-    });
-  });
+function hash(str) {
+  return require("crypto").createHash("md5").update(str).digest("hex");
 }
 
-// -------------------------
-// 실제 Git Sync
-// -------------------------
-async function gitSync() {
+// ==========================
+// git diff
+// ==========================
+function getDiff() {
+  try {
+    execSync("git add .");
+    return execSync("git diff --cached").toString();
+  } catch {
+    return "";
+  }
+}
+
+// ==========================
+// AI 분석
+// ==========================
+async function analyzeDiff(diff) {
+  try {
+    const res = await fetch(LM_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: MODEL,
+        messages: [
+          {
+            role: "system",
+            content:
+              "You are a senior software engineer. Return JSON ONLY like: {type, message}. type must be one of: feat, fix, refactor, chore. message must be short (max 12 words)."
+          },
+          {
+            role: "user",
+            content: diff
+          }
+        ],
+        temperature: 0.2
+      })
+    });
+
+    const data = await res.json();
+
+    let text = data?.choices?.[0]?.message?.content || "";
+
+    // JSON 파싱 안전 처리
+    try {
+      return JSON.parse(text);
+    } catch {
+      return {
+        type: "chore",
+        message: "auto update (AI fallback)"
+      };
+    }
+  } catch {
+    return {
+      type: "chore",
+      message: "auto update (fallback)"
+    };
+  }
+}
+
+// ==========================
+// sync
+// ==========================
+async function sync() {
   if (isProcessing) return;
   isProcessing = true;
 
+  console.log("\n🔄 Processing changes...");
+
+  const diff = getDiff();
+  if (!diff) {
+    console.log("ℹ️ No changes");
+    isProcessing = false;
+    return;
+  }
+
+  // 🔥 무한 루프 방지 (diff hash 체크)
+  const currentHash = hash(diff);
+  if (currentHash === lastHash) {
+    console.log("🛑 Duplicate change blocked");
+    isProcessing = false;
+    return;
+  }
+  lastHash = currentHash;
+
+  // AI 분석
+  const result = await analyzeDiff(diff);
+
+  const commitMessage = `[${result.type}] ${result.message}`;
+
+  console.log("🧠 AI:", commitMessage);
+
   try {
-    console.log("\n🔄 Processing changes...");
-
-    // 1. add (필터링)
-    await run(`git add .`);
-
-    // 2. 상태 체크
-    const status = await run("git status --porcelain");
-
-    if (!status.trim()) {
-      console.log("ℹ️ No real changes detected");
-      isProcessing = false;
-      return;
-    }
-
-    // 3. commit message
-    const msg = `auto update ${new Date().toISOString()}`;
-
-    console.log("🧠 Commit:", msg);
-
-    await run(`git commit -m "${msg}"`);
-
-    // 4. push
-    await run("git push origin main");
-
+    execSync(`git commit -m "${commitMessage}"`);
+    execSync("git push origin main");
     console.log("✅ PUSH SUCCESS");
-  } catch (e) {
-    console.error("❌ ERROR:", e);
+  } catch (err) {
+    console.log("❌ Git error:", err.message);
   }
 
   isProcessing = false;
 }
 
-// -------------------------
-// Watcher
-// -------------------------
-console.log("🚀 AI Safe Git Watcher v4 Started");
-console.log("📁 Watching:", repoPath);
+// ==========================
+// watcher
+// ==========================
+console.log("🚀 AI Git Watcher v6 Started");
+console.log("📁 Watching:", WATCH_PATH);
 
-const watcher = chokidar.watch(repoPath, {
-  ignored: (filePath) => {
-    return ignorePatterns.some(p => filePath.includes(p));
-  },
+chokidar.watch(WATCH_PATH, {
+  ignored: ["node_modules", ".git", "dist", "build"],
   persistent: true,
-  ignoreInitial: true,
-  awaitWriteFinish: {
-    stabilityThreshold: 800,
-    pollInterval: 100
-  }
-});
-
-watcher.on("all", (event, filePath) => {
-  console.log(`📌 ${event}: ${filePath}`);
-
-  // debounce (핵심)
-  clearTimeout(timer);
-  timer = setTimeout(() => {
-    gitSync();
-  }, 1000);
+  ignoreInitial: true
+}).on("all", (event, path) => {
+  console.log(`🔄 ${event}: ${path}`);
+  sync();
 });
