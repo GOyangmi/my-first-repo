@@ -10,41 +10,66 @@ const LM_URL = config.lm_url;
 const MODEL = config.model;
 const PROJECTS = config.projects;
 
-// =========================
-// STATE
-// =========================
+// ========================
+// GLOBAL STATE
+// ========================
 let queue = [];
 let processing = false;
-let debounceTimer = null;
+let globalLock = false;
 
-const DEBOUNCE_MS = 1500;
+const debounceMap = new Map();
+const MAX_DIFF_SIZE = 8000;
+const DEBOUNCE_MS = 2000;
+const MAX_RETRY = 2;
 
-// =========================
-// utils
-// =========================
+// ========================
+// HASH
+// ========================
 function hash(str) {
   return crypto.createHash("md5").update(str).digest("hex");
 }
 
+// ========================
+// SAFE GIT CHECK
+// ========================
 function isGitRepo(dir) {
   return fs.existsSync(path.join(dir, ".git"));
 }
 
-// =========================
-// git diff
-// =========================
+function isGitBusy(dir) {
+  try {
+    execSync("git status --porcelain", { cwd: dir, stdio: "pipe" });
+    return false;
+  } catch {
+    return true;
+  }
+}
+
+// ========================
+// SAFE DIFF
+// ========================
 function getDiff(dir) {
   try {
-    execSync("git add .", { cwd: dir });
-    return execSync("git diff --cached", { cwd: dir }).toString();
+    execSync("git add .", { cwd: dir, stdio: "ignore" });
+
+    let diff = execSync("git diff --cached", {
+      cwd: dir,
+      encoding: "utf-8"
+    });
+
+    if (diff.length > MAX_DIFF_SIZE) {
+      diff = diff.slice(0, MAX_DIFF_SIZE);
+    }
+
+    return diff;
   } catch {
     return "";
   }
 }
 
-// =========================
-// AI CALL
-// =========================
+// ========================
+// AI CALL (SAFE)
+// ========================
 async function analyzeDiff(diff) {
   try {
     const res = await fetch(LM_URL, {
@@ -56,11 +81,11 @@ async function analyzeDiff(diff) {
           {
             role: "system",
             content:
-              "Return ONLY JSON: {type, message}. No explanation."
+              "Return ONLY JSON {type, message}. No markdown, no explanation."
           },
           {
             role: "user",
-            content: diff.slice(0, 8000)
+            content: diff
           }
         ],
         temperature: 0.2
@@ -68,23 +93,36 @@ async function analyzeDiff(diff) {
     });
 
     const data = await res.json();
-    const text = data?.choices?.[0]?.message?.content || "";
+    let text = data?.choices?.[0]?.message?.content || "";
 
-    try {
-      return JSON.parse(text);
-    } catch {
-      return { type: "chore", message: "auto update" };
+    if (!text || !text.trim().startsWith("{")) {
+      return null;
     }
+
+    return JSON.parse(text);
   } catch {
-    return { type: "chore", message: "auto update" };
+    return null;
   }
 }
 
-// =========================
-// PROCESS ONE PROJECT
-// =========================
+// ========================
+// RETRY WRAPPER
+// ========================
+async function safeAnalyze(diff) {
+  for (let i = 0; i < MAX_RETRY; i++) {
+    const result = await analyzeDiff(diff);
+    if (result) return result;
+  }
+
+  return { type: "chore", message: "auto update" };
+}
+
+// ========================
+// PROCESS PROJECT
+// ========================
 async function processProject(dir) {
   if (!isGitRepo(dir)) return;
+  if (isGitBusy(dir)) return;
 
   const diff = getDiff(dir);
   if (!diff) return;
@@ -100,30 +138,32 @@ async function processProject(dir) {
     }
   } catch {}
 
-  // 중복 방지
   if (state.lastHash === key) return;
 
   state.lastHash = key;
 
-  const result = await analyzeDiff(diff);
+  const result = await safeAnalyze(diff);
 
   const message = `[${result.type}] ${result.message}`;
 
   try {
-    execSync(`git commit -m "${message}"`, { cwd: dir });
-    execSync("git push origin main", { cwd: dir });
+    execSync(`git commit -m "${message}"`, { cwd: dir, stdio: "ignore" });
+    execSync(`git push origin main`, { cwd: dir, stdio: "ignore" });
 
-    console.log(`✅ [${path.basename(dir)}] pushed`);
-  } catch {
-    console.log(`❌ [${path.basename(dir)}] git error`);
+    console.log(`✅ ${path.basename(dir)} OK`);
+  } catch (err) {
+    console.log(`❌ ${path.basename(dir)} FAILED → retry later`);
+
+    // 실패 복구 큐
+    setTimeout(() => enqueue(dir), 5000);
   }
 
   fs.writeFileSync(stateFile, JSON.stringify(state, null, 2));
 }
 
-// =========================
-// QUEUE WORKER
-// =========================
+// ========================
+// QUEUE SYSTEM (STRICT)
+// ========================
 async function worker() {
   if (processing) return;
   processing = true;
@@ -136,39 +176,37 @@ async function worker() {
   processing = false;
 }
 
-// =========================
-// QUEUE PUSH
-// =========================
 function enqueue(dir) {
   if (!queue.includes(dir)) {
     queue.push(dir);
   }
-
   worker();
 }
 
-// =========================
-// DEBOUNCE TRIGGER
-// =========================
+// ========================
+// DEBOUNCE (EVENT STORM FIX)
+// ========================
 function trigger(filePath) {
-  clearTimeout(debounceTimer);
+  clearTimeout(debounceMap.get(filePath));
 
-  debounceTimer = setTimeout(() => {
+  const t = setTimeout(() => {
     for (const dir of PROJECTS) {
-      const normalized = dir.replaceAll("\\", "/");
       const fp = filePath.replaceAll("\\", "/");
+      const d = dir.replaceAll("\\", "/");
 
-      if (fp.startsWith(normalized)) {
+      if (fp.startsWith(d)) {
         enqueue(dir);
       }
     }
   }, DEBOUNCE_MS);
+
+  debounceMap.set(filePath, t);
 }
 
-// =========================
+// ========================
 // START
-// =========================
-console.log("🚀 AI CENTRAL AGENT v7 STABLE STARTED");
+// ========================
+console.log("🚀 AI CENTRAL AGENT v7.3 (STABLE OPS MODE)");
 
 for (const dir of PROJECTS) {
   console.log("📁 watching:", dir);
@@ -177,7 +215,6 @@ for (const dir of PROJECTS) {
     ignored: ["node_modules", ".git", "dist", "build"],
     ignoreInitial: true
   }).on("all", (event, filePath) => {
-    console.log("🔄 change detected:", filePath);
     trigger(filePath);
   });
 }
