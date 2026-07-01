@@ -1,5 +1,6 @@
 const chokidar = require("chokidar");
 const { execSync } = require("child_process");
+const crypto = require("crypto");
 
 const WATCH_PATH = ".";
 const LM_URL = "http://127.0.0.1:1234/v1/chat/completions";
@@ -8,13 +9,16 @@ const MODEL = "qwen/qwen3.5-9b";
 let isProcessing = false;
 let lastHash = "";
 
+// =========================
+// hash
+// =========================
 function hash(str) {
-  return require("crypto").createHash("md5").update(str).digest("hex");
+  return crypto.createHash("md5").update(str).digest("hex");
 }
 
-// ==========================
+// =========================
 // git diff
-// ==========================
+// =========================
 function getDiff() {
   try {
     execSync("git add .");
@@ -24,9 +28,9 @@ function getDiff() {
   }
 }
 
-// ==========================
-// AI 분석
-// ==========================
+// =========================
+// AI call (CLEAN)
+// =========================
 async function analyzeDiff(diff) {
   try {
     const res = await fetch(LM_URL, {
@@ -38,7 +42,7 @@ async function analyzeDiff(diff) {
           {
             role: "system",
             content:
-              "You are a senior software engineer. Return JSON ONLY like: {type, message}. type must be one of: feat, fix, refactor, chore. message must be short (max 12 words)."
+              "Return ONLY JSON: {type, message}. No explanation, no reasoning."
           },
           {
             role: "user",
@@ -50,80 +54,66 @@ async function analyzeDiff(diff) {
     });
 
     const data = await res.json();
-
     let text = data?.choices?.[0]?.message?.content || "";
 
-    // JSON 파싱 안전 처리
     try {
       return JSON.parse(text);
     } catch {
-      return {
-        type: "chore",
-        message: "auto update (AI fallback)"
-      };
+      return { type: "chore", message: "auto update" };
     }
   } catch {
-    return {
-      type: "chore",
-      message: "auto update (fallback)"
-    };
+    return { type: "chore", message: "auto update" };
   }
 }
 
-// ==========================
+// =========================
 // sync
-// ==========================
+// =========================
 async function sync() {
   if (isProcessing) return;
   isProcessing = true;
 
-  console.log("\n🔄 Processing changes...");
-
   const diff = getDiff();
   if (!diff) {
-    console.log("ℹ️ No changes");
     isProcessing = false;
     return;
   }
 
-  // 🔥 무한 루프 방지 (diff hash 체크)
   const currentHash = hash(diff);
   if (currentHash === lastHash) {
-    console.log("🛑 Duplicate change blocked");
     isProcessing = false;
     return;
   }
   lastHash = currentHash;
 
-  // AI 분석
   const result = await analyzeDiff(diff);
 
-  const commitMessage = `[${result.type}] ${result.message}`;
+  const message = `[${result.type}] ${result.message}`;
 
-  console.log("🧠 AI:", commitMessage);
+  // 🔥 CLEAN OUTPUT ONLY
+  console.log("\n🔄 syncing...");
+  console.log("🧠", message);
 
   try {
-    execSync(`git commit -m "${commitMessage}"`);
-    execSync("git push origin main");
-    console.log("✅ PUSH SUCCESS");
-  } catch (err) {
-    console.log("❌ Git error:", err.message);
+    execSync(`git commit -m "${message}"`, { stdio: "ignore" });
+    execSync("git push origin main", { stdio: "ignore" });
+
+    console.log("✅ pushed\n");
+  } catch {
+    console.log("❌ git error\n");
   }
 
   isProcessing = false;
 }
 
-// ==========================
+// =========================
 // watcher
-// ==========================
-console.log("🚀 AI Git Watcher v6 Started");
-console.log("📁 Watching:", WATCH_PATH);
+// =========================
+console.log("🚀 CLEAN AI Watcher Started");
+console.log("📁", WATCH_PATH);
 
 chokidar.watch(WATCH_PATH, {
   ignored: ["node_modules", ".git", "dist", "build"],
   persistent: true,
   ignoreInitial: true
-}).on("all", (event, path) => {
-  console.log(`🔄 ${event}: ${path}`);
-  sync();
-});
+}).on("all", () => sync());
