@@ -1,49 +1,66 @@
-// watch.js (v2 auto git sync system)
-
 const chokidar = require("chokidar");
 const { exec } = require("child_process");
 const path = require("path");
 
 const repoPath = __dirname;
 
-console.log("🚀 Auto Git Watcher Started...");
+console.log("🚀 AI Safe Git Watcher v3 Started");
 console.log("📁 Watching:", repoPath);
 
-// debounce (연속 변경 방지)
+// debounce + 중복 방지
 let timer = null;
+let isRunning = false;
 
 function runGit() {
-  console.log("\n🔄 Changes detected. Running git sync...");
+  if (isRunning) return;
+  isRunning = true;
 
-  exec("git add .", { cwd: repoPath }, (err) => {
-    if (err) return console.error("git add error:", err);
+  console.log("\n🔄 Detected changes → syncing git...");
 
-    const msg = `auto update ${new Date().toISOString()}`;
+  exec("git status --porcelain", { cwd: repoPath }, (err, stdout) => {
+    if (!stdout.trim()) {
+      console.log("ℹ️ No real changes");
+      isRunning = false;
+      return;
+    }
 
-    exec(`git commit -m "${msg}"`, { cwd: repoPath }, (err, stdout) => {
+    exec("git add -A", { cwd: repoPath }, (err) => {
       if (err) {
-        console.log("ℹ️ Nothing to commit (clean state)");
+        console.error("git add error:", err);
+        isRunning = false;
         return;
       }
 
-      console.log(stdout);
+      const msg = `auto update ${new Date().toISOString()}`;
 
-      exec("git push origin main", { cwd: repoPath }, (err, stdout) => {
+      exec(`git commit -m "${msg}"`, { cwd: repoPath }, (err) => {
         if (err) {
-          console.error("❌ push failed:", err.message);
+          console.log("ℹ️ Nothing to commit");
+          isRunning = false;
           return;
         }
 
-        console.log("✅ PUSH SUCCESS");
+        exec("git push origin main", { cwd: repoPath }, (err) => {
+          if (err) {
+            console.error("❌ push failed:", err.message);
+          } else {
+            console.log("✅ PUSH SUCCESS");
+          }
+
+          isRunning = false;
+        });
       });
     });
   });
 }
 
-// 파일 변경 감지
 chokidar.watch(repoPath, {
-  ignored: /node_modules|\.git/,
-  persistent: true,
+  ignored: [
+    "node_modules/**",
+    ".git/**",
+    "**/dist/**",
+    "**/.env"
+  ],
   ignoreInitial: true,
 }).on("all", () => {
   clearTimeout(timer);
