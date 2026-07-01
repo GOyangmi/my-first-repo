@@ -1,139 +1,99 @@
 const chokidar = require("chokidar");
-const { exec, execSync } = require("child_process");
-const fs = require("fs");
+const { exec } = require("child_process");
+const path = require("path");
 
-const repoPath = __dirname;
+const repoPath = process.cwd();
 
-console.log("🚀 AI Git Watcher v4 Started (LM Studio AI mode)");
-console.log("📁 Watching:", repoPath);
+// 🔥 상태 관리
+let isProcessing = false;
+let lastHash = "";
 
-// 상태 제어
+// ⏱ debounce 타이머
 let timer = null;
-let isRunning = false;
 
-// -----------------------------
-// 1. 실제 변경 여부 체크
-// -----------------------------
-function hasRealChange() {
-  try {
-    const status = execSync("git status --porcelain", {
-      cwd: repoPath,
-    }).toString();
+// 🚫 무시할 경로
+const ignorePatterns = [
+  "node_modules",
+  ".git",
+  "package-lock.json"
+];
 
-    return status.trim().length > 0;
-  } catch {
-    return false;
-  }
-}
-
-// -----------------------------
-// 2. git diff 가져오기
-// -----------------------------
-function getDiff() {
-  try {
-    return execSync("git diff --cached", {
-      cwd: repoPath,
-    }).toString();
-  } catch {
-    return "";
-  }
-}
-
-// -----------------------------
-// 3. LM Studio AI 호출
-// -----------------------------
-async function generateCommitMessage(diff) {
-  try {
-    const res = await fetch("http://localhost:1234/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        model: "local-model",
-        messages: [
-          {
-            role: "system",
-            content:
-              "You are a developer assistant. Generate short git commit messages.",
-          },
-          {
-            role: "user",
-            content: `Summarize this git diff into a short commit message:\n\n${diff}`,
-          },
-        ],
-        temperature: 0.2,
-      }),
+// -------------------------
+// Git 실행 함수
+// -------------------------
+function run(cmd) {
+  return new Promise((resolve, reject) => {
+    exec(cmd, (err, stdout, stderr) => {
+      if (err) reject(stderr || err);
+      else resolve(stdout);
     });
-
-    const data = await res.json();
-    return (
-      data.choices?.[0]?.message?.content?.trim() ||
-      "auto update (no AI message)"
-    );
-  } catch (e) {
-    return "auto update (AI fallback)";
-  }
+  });
 }
 
-// -----------------------------
-// 4. Git 실행
-// -----------------------------
-async function runGit() {
-  if (isRunning) return;
-  isRunning = true;
-
-  console.log("\n🔄 Processing changes...");
-
-  if (!hasRealChange()) {
-    console.log("ℹ️ No real changes detected");
-    isRunning = false;
-    return;
-  }
+// -------------------------
+// 실제 Git Sync
+// -------------------------
+async function gitSync() {
+  if (isProcessing) return;
+  isProcessing = true;
 
   try {
-    // stage
-    execSync("git add -A", { cwd: repoPath });
+    console.log("\n🔄 Processing changes...");
 
-    // diff
-    const diff = getDiff().slice(0, 3000); // 너무 길면 제한
+    // 1. add (필터링)
+    await run(`git add .`);
 
-    // AI 메시지 생성
-    const msg = await generateCommitMessage(diff);
+    // 2. 상태 체크
+    const status = await run("git status --porcelain");
 
-    console.log("🧠 AI Commit Message:", msg);
+    if (!status.trim()) {
+      console.log("ℹ️ No real changes detected");
+      isProcessing = false;
+      return;
+    }
 
-    // commit
-    execSync(`git commit -m "${msg.replace(/"/g, "'")}"`, {
-      cwd: repoPath,
-    });
+    // 3. commit message
+    const msg = `auto update ${new Date().toISOString()}`;
 
-    // push
-    execSync("git push origin main", { cwd: repoPath });
+    console.log("🧠 Commit:", msg);
+
+    await run(`git commit -m "${msg}"`);
+
+    // 4. push
+    await run("git push origin main");
 
     console.log("✅ PUSH SUCCESS");
-  } catch (err) {
-    console.log("ℹ️ Nothing to commit or error");
+  } catch (e) {
+    console.error("❌ ERROR:", e);
   }
 
-  isRunning = false;
+  isProcessing = false;
 }
 
-// -----------------------------
-// 5. watcher
-// -----------------------------
-chokidar
-  .watch(repoPath, {
-    ignored: [
-      "node_modules/**",
-      ".git/**",
-      "**/dist/**",
-      "**/.env",
-      "**/*.log",
-    ],
-    ignoreInitial: true,
-  })
-  .on("all", () => {
-    clearTimeout(timer);
-    timer = setTimeout(runGit, 4000);
-  });
+// -------------------------
+// Watcher
+// -------------------------
+console.log("🚀 AI Safe Git Watcher v4 Started");
+console.log("📁 Watching:", repoPath);
+
+const watcher = chokidar.watch(repoPath, {
+  ignored: (filePath) => {
+    return ignorePatterns.some(p => filePath.includes(p));
+  },
+  persistent: true,
+  ignoreInitial: true,
+  awaitWriteFinish: {
+    stabilityThreshold: 800,
+    pollInterval: 100
+  }
+});
+
+watcher.on("all", (event, filePath) => {
+  console.log(`📌 ${event}: ${filePath}`);
+
+  // debounce (핵심)
+  clearTimeout(timer);
+  timer = setTimeout(() => {
+    gitSync();
+  }, 1000);
+});
