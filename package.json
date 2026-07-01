@@ -1,0 +1,24 @@
+{
+  "name": "my-first-repo",
+  "version": "1.0.0",
+  "description": "",
+  "main": "watch.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/GOyangmi/my-first-repo.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/GOyangmi/my-first-repo/issues"
+  },
+  "homepage": "https://github.com/GOyangmi/my-first-repo#readme",
+  "dependencies": {
+    "chokidar": "^5.0.0"
+  }
+}
